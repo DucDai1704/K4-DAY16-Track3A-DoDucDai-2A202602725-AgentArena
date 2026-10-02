@@ -73,22 +73,70 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _find_doc(text: str, docs, observed: str):
+    for doc in docs:
+        if doc.body in observed and any(text in line for line in doc.body.splitlines()):
+            return doc
+    return None
+
+
+def _try_split(text: str, docs, observed: str):
+    delim = " và "
+    start_pos = 0
+    while True:
+        pos = text.find(delim, start_pos)
+        if pos == -1:
+            break
+        h1 = text[:pos]
+        h2 = text[pos + len(delim):]
+        if h1 in observed and h2 in observed:
+            d1 = _find_doc(h1, docs, observed)
+            d2 = _find_doc(h2, docs, observed)
+            if d1 and d2 and d1.doc_id != d2.doc_id:
+                return (h1, d1.doc_id), (h2, d2.doc_id)
+        start_pos = pos + 1
+    return None
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not claims or not isinstance(claims, list):
+            return report
+
+        observed = ctx.observed_text or ""
+        docs = ctx.corpus.docs if ctx.corpus else []
+
+        new_claims = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+            if text in observed:
+                new_claims.append(claim)
+            else:
+                split = _try_split(text, docs, observed)
+                if split:
+                    (h1, d1), (h2, d2) = split
+                    new_claims.append({"text": h1, "doc_id": d1})
+                    new_claims.append({"text": h2, "doc_id": d2})
+                    report["abstain"] = True
+
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Tài liệu hiện có không đủ căn cứ để trả lời câu hỏi này."
+        else:
+            report["claims"] = new_claims
+            report["citations"] = sorted({c["doc_id"] for c in new_claims if isinstance(c, dict) and c.get("doc_id")})
+
+        return report
